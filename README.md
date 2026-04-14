@@ -10,54 +10,68 @@
 
 Insight anticipation asks a model to predict a downstream paper's core contribution from the summaries of its two foundational parent papers. This repository contains the training and reward code used for our reinforcement-learning experiments, packaged as a clean, submission-ready release on top of the `verl` training stack.
 
-## Why this repo exists
-
-Scientific progress is often evolutionary: new papers synthesize prior ideas into focused, mechanistic advances. We operationalize that process as a grounded generation task and train language models to anticipate those advances rather than brainstorm in the abstract.
-
-This release includes:
-
-- A portable supervised fine-tuning entrypoint for bootstrapping the policy.
-- A GRPO training pipeline that optimizes an LM-judge similarity reward.
-- An anonymized reward implementation for scoring predicted insights against held-out downstream contributions.
-- A trimmed codebase with credentials, personal paths, upload utilities, and local-only artifacts removed.
-
 ## At a glance
 
 | Component | Purpose | Entry point |
 | --- | --- | --- |
-| SFT | Bootstrap a policy on parent-summary to insight pairs | `scripts/sft_mult_4gpu_insight_ampere.sh` |
-| GRPO | Optimize the policy with similarity-based rewards | `scripts/grpo/train_local_insight_similarity_ampere.sh` |
+| SFT | Bootstrap a policy on parent-summary to insight pairs | `scripts/train_sft.sh` |
+| GRPO | Optimize the policy with similarity-based rewards | `scripts/grpo/train_grpo.sh` |
 | Reward judge | Score generated insights against ground truth | `verl/utils/reward_score/insight_similarity/compute_score.py` |
 | Core training stack | Distributed training and rollout infrastructure | `verl/` |
 
-## Main result path
+## End-to-end pipeline
 
-If you only need the script used for the primary RL experiments, start with:
+The full reproduction path is four steps. Each step assumes you are in the repo root with the `insight-anticipation` conda env activated (see Step 1).
 
-```bash
-bash scripts/grpo/train_local_insight_similarity_ampere.sh
+```
+Step 1: Install environment
+Step 2: Prepare SFT + RL data from Hugging Face
+Step 3: Run SFT to get a bootstrapped policy
+Step 4: Run GRPO from the SFT checkpoint
 ```
 
-That script is now environment-driven and no longer depends on institution-specific paths, credentials, or cluster setup.
+---
 
-## Installation
+### Step 1 — Install the environment
 
-We recommend Python 3.10 and a fresh environment.
+Requires **Python 3.10** and **CUDA 12.4** (the pinned `torch==2.6.0` and `flashinfer` wheels are cu124-specific).
 
 ```bash
-conda create -n insight-anticipation python=3.10
+conda create -n insight-anticipation python=3.10 -y
 conda activate insight-anticipation
 
-pip install -e .
 pip install -r requirements.txt
-pip install vllm==0.8.4
+pip install -e .
 ```
 
-Depending on your CUDA and PyTorch stack, you may also want a local `flash-attn` install that matches your environment.
+All package versions are pinned in [`requirements.txt`](requirements.txt) to match the env used for the paper. If `flash_attn` or `xformers` fail to build, install `torch==2.6.0` first, then re-run `pip install -r requirements.txt`.
 
-## Data layout
+---
 
-The release expects dataset directories of the form:
+### Step 2 — Prepare data
+
+The public dataset lives at [`giants2026/GiantsBench-train`](https://huggingface.co/datasets/giants2026/GiantsBench-train). If it is gated, authenticate first with `huggingface-cli login` or `export HF_TOKEN=...`.
+
+**SFT splits** (`query` / `completion` columns):
+
+```bash
+python scripts/prepare_sft_data.py \
+    --dataset giants2026/GiantsBench-train \
+    --output-dir data/insight_anticipation_sft
+```
+
+**GRPO splits** (verl RL schema: `prompt` / `reward_model.ground_truth` / `extra_info`):
+
+```bash
+python scripts/prepare_rl_data.py \
+    --dataset giants2026/GiantsBench-train \
+    --output-dir data/insight_anticipation_grpo \
+    --drop-empty-insights
+```
+
+`prepare_rl_data.py` wraps each `query` into a single-turn chat prompt and extracts the `<insight>...</insight>` block from `completion` as `reward_model.ground_truth`. Both scripts auto-carve a deterministic 3% test split (seed 42) when the source has no `test` split; override via `--test-size` / `--seed` if needed.
+
+You should end up with:
 
 ```text
 data/
@@ -69,15 +83,13 @@ data/
     test.parquet
 ```
 
-Expected columns:
+See `verl/utils/dataset/README.md` for the base RL dataset contract.
 
-- SFT data uses `query` and `completion`.
-- GRPO data follows the `verl` RL format and should include a prompt field, `data_source`, and `reward_model.ground_truth`.
-- Optional `extra_info` metadata can be stored alongside each GRPO example for debugging or evaluation.
+---
 
-See `verl/utils/dataset/README.md` for the base RL dataset contract used by `verl`.
+### Step 3 — Run SFT
 
-## Running SFT
+4-GPU SFT launcher:
 
 ```bash
 BASE_MODEL=Qwen/Qwen3-4B \
@@ -85,17 +97,35 @@ TRAIN_DATA_DIR=$PWD/data/insight_anticipation_sft \
 EVAL_DATA_DIR=$PWD/data/insight_anticipation_sft \
 GPU_IDS=0,1,2,3 \
 EXPERIMENT_NAME=qwen3-4b-sft \
-bash scripts/sft_mult_4gpu_insight_ampere.sh
+TRAINER_DEFAULT_LOCAL_DIR=$PWD/outputs/sft \
+bash scripts/train_sft.sh
 ```
 
-Important knobs:
+Key knobs:
 
-- `BASE_MODEL`: Hugging Face model ID or local checkpoint.
-- `GPU_IDS`: Comma-separated GPU list.
-- `TRAINER_DEFAULT_LOCAL_DIR`: Output directory for checkpoints and logs.
-- `TRAINER_LOGGERS`: Hydra list string, for example `['console']` or `['console','wandb']`.
+- `BASE_MODEL` — Hugging Face model ID or local checkpoint.
+- `GPU_IDS` — Comma-separated GPU list.
+- `TRAINER_DEFAULT_LOCAL_DIR` — Output directory for checkpoints and logs.
+- `TRAINER_LOGGERS` — Hydra list string, e.g. `['console']` or `['console','wandb']`.
 
-## Running GRPO
+The resulting checkpoint path (under `TRAINER_DEFAULT_LOCAL_DIR/EXPERIMENT_NAME`) becomes the `BASE_MODEL` for Step 4.
+
+---
+
+### Step 4 — Run GRPO
+
+Before launching, configure the reward judge (Gemini via API key **or** Vertex AI):
+
+```bash
+# Option A: Gemini API key
+export GEMINI_API_KEY=...
+
+# Option B: Vertex AI
+export GOOGLE_CLOUD_PROJECT=your-project
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+Then launch the 4-GPU GRPO run from the SFT checkpoint:
 
 ```bash
 BASE_MODEL=$PWD/outputs/sft/qwen3-4b-sft \
@@ -104,56 +134,28 @@ EVAL_DATA_DIR=$PWD/data/insight_anticipation_grpo \
 GPU_IDS=0,1,2,3 \
 EXPERIMENT_NAME=qwen3-4b-grpo-similarity \
 ROLLOUT_TP_SIZE=1 \
-bash scripts/grpo/train_local_insight_similarity_ampere.sh
+bash scripts/grpo/train_grpo.sh
 ```
 
-The GRPO launcher exposes the most important hyperparameters as environment variables, including:
+Exposed hyperparameters:
 
-- `MAX_PROMPT_LENGTH`
-- `MAX_MODEL_LEN`
-- `ROLLOUT_N`
-- `ACTOR_LR`
-- `TRAIN_BATCH_SIZE`
-- `TOTAL_TRAINING_STEPS`
-
-## Judge configuration
-
-The insight-similarity reward uses `google-genai` and supports either:
-
-1. Gemini API keys via `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-2. Vertex AI via `GOOGLE_CLOUD_PROJECT` plus your usual Google credentials flow
-
-Minimal examples:
-
-```bash
-export GEMINI_API_KEY=...
-```
-
-or
-
-```bash
-export GOOGLE_CLOUD_PROJECT=your-project
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
-```
+- `MAX_PROMPT_LENGTH`, `MAX_MODEL_LEN`
+- `ROLLOUT_N`, `ROLLOUT_TP_SIZE`
+- `ACTOR_LR`, `TRAIN_BATCH_SIZE`, `TOTAL_TRAINING_STEPS`
 
 Optional reward controls:
 
-- `INSIGHT_SIMILARITY_MODEL` defaults to `gemini-2.5-flash`
-- `INSIGHT_SIMILARITY_MAX_TOKENS` defaults to `8192`
-- `INSIGHT_SIMILARITY_DEBUG_DIR` writes prompt/response traces for debugging
+- `INSIGHT_SIMILARITY_MODEL` — defaults to `gemini-2.5-flash`.
+- `INSIGHT_SIMILARITY_MAX_TOKENS` — defaults to `8192`.
+- `INSIGHT_SIMILARITY_DEBUG_DIR` — writes prompt/response traces for debugging.
 
-## What changed for release
-
-- Removed hard-coded tokens, usernames, email addresses, and service-account paths.
-- Removed upload helpers, notebooks, and cluster-local experiment leftovers that were not needed for the submission artifact.
-- Replaced site-specific shell scripts with portable launchers rooted at the current checkout.
-- Kept the repo centered on the insight-anticipation training path rather than unrelated side experiments.
+---
 
 ## Notes for anonymous review
 
-- External dataset and checkpoint links are intentionally omitted here.
+- External dataset and checkpoint links are intentionally minimal.
 - The code is organized so anonymous artifacts can be mounted locally without modifying source files.
-- All experiment launchers are now parameterized through environment variables.
+- All experiment launchers are parameterized through environment variables — no institution-specific paths or credentials are required.
 
 ## Acknowledgments
 
