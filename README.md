@@ -151,12 +151,6 @@ Optional reward controls:
 
 ---
 
-## Notes for anonymous review
-
-- External dataset and checkpoint links are intentionally minimal.
-- The code is organized so anonymous artifacts can be mounted locally without modifying source files.
-- All experiment launchers are parameterized through environment variables — no institution-specific paths or credentials are required.
-
 ## Acknowledgments
 
 This project builds on the `verl` reinforcement-learning stack. Upstream license and notices are preserved in this repository.
